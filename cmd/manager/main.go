@@ -40,6 +40,8 @@ import (
 	argocd "github.com/argoproj-labs/argocd-operator/pkg/apis"
 
 	routev1 "github.com/openshift/api/route/v1"
+
+	monitoringv1 "github.com/coreos/prometheus-operator/pkg/apis/monitoring/v1"
 )
 
 // Change below variables to serve metrics on different host or port.
@@ -139,6 +141,7 @@ func main() {
 	registerComponentOrExit(mgr, operatorsv1.AddToScheme)
 	registerComponentOrExit(mgr, operatorsv1alpha1.AddToScheme)
 	registerComponentOrExit(mgr, argoapi.AddToScheme)
+	registerComponentOrExit(mgr, monitoringv1.AddToScheme)
 
 	// Add the Metrics Service
 	addMetrics(ctx, cfg)

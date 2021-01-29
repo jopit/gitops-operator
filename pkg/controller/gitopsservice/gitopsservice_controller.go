@@ -3,11 +3,13 @@ package gitopsservice
 import (
 	"context"
 	"fmt"
+	"github.com/go-logr/logr"
 	"os"
 
 	appsv1 "k8s.io/api/apps/v1"
 
 	argoapp "github.com/argoproj-labs/argocd-operator/pkg/apis/argoproj/v1alpha1"
+	monitoring "github.com/coreos/prometheus-operator/pkg/apis/monitoring/v1"
 	routev1 "github.com/openshift/api/route/v1"
 
 	pipelinesv1alpha1 "github.com/redhat-developer/gitops-operator/pkg/apis/pipelines/v1alpha1"
@@ -19,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -42,6 +45,12 @@ var (
 	serviceNamespace           = "openshift-gitops"
 	insecureEnvVar             = "INSECURE"
 	insecureEnvVarValue        = "true"
+)
+
+const (
+	readRoleNameFormat        = "%s-read"
+	readRoleBindingNameFormat = "%s-prometheus-k8s-read-binding"
+	alertRuleName = "gitops-operator-argocd-alerts"
 )
 
 // Add creates a new GitopsService Controller and adds it to the Manager. The Manager will set fields on the Controller
@@ -125,6 +134,20 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		reqLogger.Error(err, "Failed to create namespace", "Namespace", serviceNamespace)
 	}
 
+	readRoleRef := newReadRole()
+	reqLogger.Info("Creating new read role", "Name", readRoleRef.Name)
+	err = client.Create(context.TODO(), readRoleRef)
+	if err != nil {
+		reqLogger.Error(err, "Failed to create read role", "Name", readRoleRef.Name)
+	}
+
+	readRoleBindingRef := newReadRoleBinding()
+	reqLogger.Info("Creating new read role binding", "Name", readRoleBindingRef.Name)
+	err = client.Create(context.TODO(), readRoleBindingRef)
+	if err != nil {
+		reqLogger.Error(err, "Failed to create read role binding", "Name", readRoleBindingRef.Name)
+	}
+
 	gitopsServiceRef := newGitopsService()
 	err = client.Create(context.TODO(), gitopsServiceRef)
 	if err != nil {
@@ -185,6 +208,32 @@ func (r *ReconcileGitopsService) Reconcile(request reconcile.Request) (reconcile
 		}
 	}
 
+	// ServiceMonitor for ArgoCD application metrics
+	serviceMonitorLabel := fmt.Sprintf("%s-metrics", argoCDIdentifier)
+	err = r.createServiceMonitorIfAbsent(serviceMonitorLabel, reqLogger)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// ServiceMonitor for ArgoCD API server metrics
+	serviceMonitorLabel = fmt.Sprintf("%s-server-metrics", argoCDIdentifier)
+	err = r.createServiceMonitorIfAbsent(serviceMonitorLabel, reqLogger)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// ServiceMonitor for ArgoCD repo server metrics
+	serviceMonitorLabel = fmt.Sprintf("%s-repo-server", argoCDIdentifier)
+	err = r.createServiceMonitorIfAbsent(serviceMonitorLabel, reqLogger)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	err = r.createPrometheusRuleIfAbsent(reqLogger)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
 	// Define a new Pod object
 	deploymentObj := newBackendDeployment(request.Name, serviceNamespace)
 
@@ -239,6 +288,49 @@ func (r *ReconcileGitopsService) Reconcile(request reconcile.Request) (reconcile
 	}
 
 	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileGitopsService) createServiceMonitorIfAbsent(serviceMonitorLabel string, reqLogger logr.Logger) (error) {
+	existingServiceMonitor := &monitoring.ServiceMonitor{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Name: serviceMonitorLabel, Namespace: serviceNamespace}, existingServiceMonitor)
+	if err == nil {
+		reqLogger.Info("A ServiceMonitor instance already exists",
+			"Name", existingServiceMonitor.Name)
+		return nil
+	}
+	if errors.IsNotFound(err) {
+		serviceMonitor := newServiceMonitor(serviceMonitorLabel)
+		reqLogger.Info("Creating a new ServiceMonitor instance", "Name", serviceMonitor.Name)
+		err = r.client.Create(context.TODO(), serviceMonitor)
+		if err != nil {
+			reqLogger.Info("Error creating a new ServiceMonitor instance","Name", serviceMonitor.Name)
+			return err
+		}
+		return nil
+	}
+	reqLogger.Info("Error querying for ServiceMonitor", "Name", serviceMonitorLabel)
+	return err
+}
+
+func (r *ReconcileGitopsService) createPrometheusRuleIfAbsent(reqLogger logr.Logger) error {
+	existingAlertRule := &monitoring.PrometheusRule{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Name: alertRuleName, Namespace: serviceNamespace}, existingAlertRule)
+	if err == nil {
+		reqLogger.Info("An alert rule instance already exists", "Name", existingAlertRule.Name)
+		return nil
+	}
+	if errors.IsNotFound(err) {
+		alertRule := newPrometheusRule()
+		reqLogger.Info("Creating new alert rule", "Name", alertRule.Name)
+		err := r.client.Create(context.TODO(), alertRule)
+		if err != nil {
+			reqLogger.Error(err, "Error creating a new alert rule", "Name", alertRule.Name)
+			return err
+		}
+		return nil
+	}
+	reqLogger.Info("Error querying for existing alert rule", "Name", alertRuleName)
+	return err
 }
 
 func objectMeta(resourceName string, namespace string, opts ...func(*metav1.ObjectMeta)) metav1.ObjectMeta {
@@ -391,5 +483,107 @@ func newGitopsService() *pipelinesv1alpha1.GitopsService {
 			Name: serviceName,
 		},
 		Spec: pipelinesv1alpha1.GitopsServiceSpec{},
+	}
+}
+
+func newReadRole() *rbacv1.Role {
+	objectMeta := metav1.ObjectMeta{
+		Name: fmt.Sprintf(readRoleNameFormat, serviceNamespace),
+		Namespace: serviceNamespace,
+	}
+	rules := []rbacv1.PolicyRule {
+		{
+			APIGroups: []string{""},
+			Resources: []string{"endpoints", "services", "pods"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+	}
+	return &rbacv1.Role{
+		ObjectMeta: objectMeta,
+		Rules: rules,
+	}
+}
+
+func newReadRoleBinding() *rbacv1.RoleBinding {
+	objectMeta := metav1.ObjectMeta{
+		Name: fmt.Sprintf(readRoleBindingNameFormat, serviceNamespace),
+		Namespace: serviceNamespace,
+	}
+	roleRef := rbacv1.RoleRef{
+		APIGroup: "rbac.authorization.k8s.io",
+		Kind: "Role",
+		Name: fmt.Sprintf(readRoleNameFormat, serviceNamespace),
+	}
+	subjects := []rbacv1.Subject{
+		{
+			Kind: "ServiceAccount",
+			Name: "prometheus-k8s",
+			Namespace: "openshift-monitoring",
+		},
+	}
+	return &rbacv1.RoleBinding{
+		ObjectMeta: objectMeta,
+		RoleRef: roleRef,
+		Subjects: subjects,
+	}
+}
+
+func newServiceMonitor(matchLabel string) *monitoring.ServiceMonitor {
+	// we also use the matchLabel for the name of the ServiceMonitor
+	objectMeta := metav1.ObjectMeta{
+		Name:      matchLabel,
+		Namespace: serviceNamespace,
+		Labels: map[string]string{
+			"release": "prometheus-operator",
+		},
+	}
+	spec := monitoring.ServiceMonitorSpec{
+		Selector: metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"app.kubernetes.io/name": matchLabel,
+			},
+		},
+		Endpoints: []monitoring.Endpoint{
+			{
+				Port: "metrics",
+			},
+		},
+	}
+	return &monitoring.ServiceMonitor{
+		ObjectMeta: objectMeta,
+		Spec: spec,
+	}
+}
+
+func newPrometheusRule() *monitoring.PrometheusRule {
+	objectMeta := metav1.ObjectMeta{
+		Name:      alertRuleName,
+		Namespace: serviceNamespace,
+	}
+	spec := monitoring.PrometheusRuleSpec{
+		Groups: []monitoring.RuleGroup{
+			{
+				Name: "GitOpsOperatorArgoCD",
+				Rules: []monitoring.Rule{
+					{
+						Alert: "ArgoCDSyncAlert",
+						Annotations: map[string]string{
+							"message": "ArgoCD application {{ $labels.name }} is out of sync",
+						},
+						Expr: intstr.IntOrString{
+							Type: intstr.String,
+							StrVal: "argocd_app_info{sync_status=\"OutOfSync\"} > 0",
+						},
+						Labels: map[string]string{
+							"severity": "warning",
+						},
+					},
+				},
+			},
+		},
+	}
+	return &monitoring.PrometheusRule{
+		ObjectMeta: objectMeta,
+		Spec: spec,
 	}
 }
