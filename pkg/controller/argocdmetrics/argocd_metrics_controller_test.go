@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"os"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -244,7 +245,7 @@ func TestReconcile_add_service_monitors(t *testing.T) {
 	}
 }
 
-func TestReconciler_add_prometheus_rule(t *testing.T) {
+func TestReconciler_add_prometheus_rule_for_cluster_config(t *testing.T) {
 	testCases := []struct {
 		instanceName string
 		namespace    string
@@ -258,7 +259,10 @@ func TestReconciler_add_prometheus_rule(t *testing.T) {
 			namespace:    "namespace-two",
 		},
 	}
+	defer os.Unsetenv("ARGOCD_CLUSTER_CONFIG_NAMESPACES")
 	for _, tc := range testCases {
+		os.Setenv("ARGOCD_CLUSTER_CONFIG_NAMESPACES", tc.namespace + ",foo,bar")
+
 		r := newMetricsReconciler(t, tc.namespace, tc.instanceName)
 		_, err := r.Reconcile(newRequest(tc.namespace, tc.instanceName))
 		assert.NilError(t, err)
@@ -276,5 +280,152 @@ func TestReconciler_add_prometheus_rule(t *testing.T) {
 		assert.Assert(t, rule.Spec.Groups[0].Rules[0].Labels["severity"] != "")
 		expr := fmt.Sprintf("argocd_app_info{namespace=\"%s\",sync_status=\"OutOfSync\"} > 0", tc.namespace)
 		assert.Equal(t, rule.Spec.Groups[0].Rules[0].Expr.StrVal, expr)
+	}
+}
+
+func TestReconciler_add_prometheus_rule_for_labeled_namespace(t *testing.T) {
+	testCases := []struct {
+		instanceName string
+		namespace    string
+	}{
+		{
+			instanceName: "argocd-cluster",
+			namespace:    "openshift-gitops",
+		},
+		{
+			instanceName: "instance-two",
+			namespace:    "namespace-two",
+		},
+	}
+	for _, tc := range testCases {
+		r := newMetricsReconciler(t, tc.namespace, tc.instanceName)
+
+		namespace := corev1.Namespace{
+			ObjectMeta: v1.ObjectMeta{
+				Name: tc.namespace,
+				Labels: map[string]string{
+					"openshift.io/enable-argocd-sync-alert": "true",
+				},
+			},
+		}
+		r.client.Update(context.TODO(), &namespace)
+
+		_, err := r.Reconcile(newRequest(tc.namespace, tc.instanceName))
+		assert.NilError(t, err)
+
+		rule := monitoringv1.PrometheusRule{}
+		err = r.client.Get(context.TODO(), types.NamespacedName{Name: "gitops-operator-argocd-alerts", Namespace: tc.namespace}, &rule)
+		assert.NilError(t, err)
+
+		assert.Assert(t, is.Len(rule.OwnerReferences, 1))
+		assert.Equal(t, rule.OwnerReferences[0].Kind, argocdKind)
+		assert.Equal(t, rule.OwnerReferences[0].Name, tc.instanceName)
+
+		assert.Equal(t, rule.Spec.Groups[0].Rules[0].Alert, "ArgoCDSyncAlert")
+		assert.Assert(t, rule.Spec.Groups[0].Rules[0].Annotations["message"] != "")
+		assert.Assert(t, rule.Spec.Groups[0].Rules[0].Labels["severity"] != "")
+		expr := fmt.Sprintf("argocd_app_info{namespace=\"%s\",sync_status=\"OutOfSync\"} > 0", tc.namespace)
+		assert.Equal(t, rule.Spec.Groups[0].Rules[0].Expr.StrVal, expr)
+	}
+}
+
+func TestReconciler_no_prometheus_rule_for_labeled_namespace(t *testing.T) {
+	testCases := []struct {
+		instanceName string
+		namespace    string
+	}{
+		{
+			instanceName: "argocd-cluster",
+			namespace:    "openshift-gitops",
+		},
+		{
+			instanceName: "instance-two",
+			namespace:    "namespace-two",
+		},
+	}
+	for _, tc := range testCases {
+		r := newMetricsReconciler(t, tc.namespace, tc.instanceName)
+
+		namespace := corev1.Namespace{
+			ObjectMeta: v1.ObjectMeta{
+				Name: tc.namespace,
+				Labels: map[string]string{
+					"openshift.io/enable-argocd-sync-alert": "false",
+				},
+			},
+		}
+		r.client.Update(context.TODO(), &namespace)
+
+		_, err := r.Reconcile(newRequest(tc.namespace, tc.instanceName))
+		assert.NilError(t, err)
+
+		rule := monitoringv1.PrometheusRule{}
+		err = r.client.Get(context.TODO(), types.NamespacedName{Name: "gitops-operator-argocd-alerts", Namespace: tc.namespace}, &rule)
+		assert.ErrorContains(t, err, "not found")
+	}
+}
+
+func TestReconciler_no_prometheus_rule_for_unqualified_namespace(t *testing.T) {
+	testCases := []struct {
+		instanceName string
+		namespace    string
+	}{
+		{
+			instanceName: "argocd-cluster",
+			namespace:    "openshift-gitops",
+		},
+		{
+			instanceName: "instance-two",
+			namespace:    "namespace-two",
+		},
+	}
+	for _, tc := range testCases {
+		r := newMetricsReconciler(t, tc.namespace, tc.instanceName)
+
+		_, err := r.Reconcile(newRequest(tc.namespace, tc.instanceName))
+		assert.NilError(t, err)
+
+		rule := monitoringv1.PrometheusRule{}
+		err = r.client.Get(context.TODO(), types.NamespacedName{Name: "gitops-operator-argocd-alerts", Namespace: tc.namespace}, &rule)
+		assert.ErrorContains(t, err, "not found")
+	}
+}
+
+func TestReconciler_no_prometheus_rule_for_cluster_config(t *testing.T) {
+	testCases := []struct {
+		instanceName string
+		namespace    string
+	}{
+		{
+			instanceName: "argocd-cluster",
+			namespace:    "openshift-gitops",
+		},
+		{
+			instanceName: "instance-two",
+			namespace:    "namespace-two",
+		},
+	}
+	defer os.Unsetenv("ARGOCD_CLUSTER_CONFIG_NAMESPACES")
+	for _, tc := range testCases {
+		os.Setenv("ARGOCD_CLUSTER_CONFIG_NAMESPACES", tc.namespace + ",foo,bar")
+
+		r := newMetricsReconciler(t, tc.namespace, tc.instanceName)
+
+		namespace := corev1.Namespace{
+			ObjectMeta: v1.ObjectMeta{
+				Name: tc.namespace,
+				Labels: map[string]string{
+					"openshift.io/enable-argocd-sync-alert": "false",
+				},
+			},
+		}
+		r.client.Update(context.TODO(), &namespace)
+
+		_, err := r.Reconcile(newRequest(tc.namespace, tc.instanceName))
+		assert.NilError(t, err)
+
+		rule := monitoringv1.PrometheusRule{}
+		err = r.client.Get(context.TODO(), types.NamespacedName{Name: "gitops-operator-argocd-alerts", Namespace: tc.namespace}, &rule)
+		assert.ErrorContains(t, err, "not found")
 	}
 }

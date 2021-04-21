@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"os"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -21,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+	"strings"
 )
 
 const (
@@ -267,9 +269,30 @@ func (r *ArgoCDMetricsReconciler) createServiceMonitorIfAbsent(namespace string,
 }
 
 func (r *ArgoCDMetricsReconciler) createPrometheusRuleIfAbsent(namespace string, argocd *argoapp.ArgoCD, reqLogger logr.Logger) error {
+	ns := corev1.Namespace{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Name: namespace}, &ns)
+	if err != nil {
+		reqLogger.Error(err, "Error getting namespace for alert rulr",
+			"Namespace", namespace, "ArgoCD Name", argocd.Name)
+		return err
+	}
+	var shouldCreate bool
+	if ns.Labels["openshift.io/enable-argocd-sync-alert"] == "true" {
+		shouldCreate = true
+	} else if ns.Labels["openshift.io/enable-argocd-sync-alert"] == "false" {
+		shouldCreate = false
+	} else if isClusterConfigNamespace(namespace) {
+		shouldCreate = true
+	} else {
+		shouldCreate = false
+	}
+	if !shouldCreate {
+		return nil
+	}
+
 	alertRule := newPrometheusRule(namespace)
 	existingAlertRule := &monitoringv1.PrometheusRule{}
-	err := r.client.Get(context.TODO(), types.NamespacedName{Name: alertRule.Name, Namespace: alertRule.Namespace}, existingAlertRule)
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: alertRule.Name, Namespace: alertRule.Namespace}, existingAlertRule)
 	if err == nil {
 		reqLogger.Info("An alert rule instance already exists",
 			"Namespace", existingAlertRule.Namespace, "Name", existingAlertRule.Name)
@@ -406,4 +429,28 @@ func newPrometheusRule(namespace string) *monitoringv1.PrometheusRule {
 		ObjectMeta: objectMeta,
 		Spec:       spec,
 	}
+}
+
+func isClusterConfigNamespace(namespace string) bool {
+	clusterConfigNamespaces := splitList(os.Getenv( "ARGOCD_CLUSTER_CONFIG_NAMESPACES"))
+	if len(clusterConfigNamespaces) > 0 {
+		if clusterConfigNamespaces[0] == "*" {
+			return true
+		}
+
+		for _, n := range clusterConfigNamespaces {
+			if n == namespace {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func splitList(s string) []string {
+	elems := strings.Split(s, ",")
+	for i := range elems {
+		elems[i] = strings.TrimSpace(elems[i])
+	}
+	return elems
 }
